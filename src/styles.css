@@ -349,3 +349,4 @@ select.input { appearance: auto; }
 .live-row p { margin: 0; line-height: 1.5; }
 .live-row .who.muted { font-size: 13px; font-weight: 600; }
 .warn-text { color: var(--warn); }
+.identify-actions { display: flex; flex-direction: column; gap: 6px; align-items: flex-end; }

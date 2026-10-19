@@ -196,6 +196,7 @@ function TranscriptTab({ m, setM, seek, isLive }) {
   const [editing, setEditing] = useState(null);
   const [q, setQ] = useState('');
   const [identBusy, setIdentBusy] = useState(false);
+  const [identFailed, setIdentFailed] = useState(false);
 
   const name = (s) => displayName(m, s);
   const hasVoices = speakers.some((s) => /^Talare \d+$/.test(s));
@@ -203,11 +204,13 @@ function TranscriptTab({ m, setM, seek, isLive }) {
   const identify = async () => {
     if (hasVoices && !confirm('Identifiera rösterna på nytt? Repliker som du ändrat för hand kan få en ny röst. Namn du satt på rösterna behålls.')) return;
     setIdentBusy(true);
+    setIdentFailed(false);
     try {
       setM(await api.identifyVoices(m.id));
       toast('Klart! Välj nu vem varje röst är.', 'ok');
     } catch (e) {
       toast(String(e.message).replace(/^Error invoking remote method '[^']+': (Error: )?/, ''), 'err');
+      setIdentFailed(true);
     } finally {
       setIdentBusy(false);
     }
@@ -234,9 +237,20 @@ function TranscriptTab({ m, setM, seek, isLive }) {
                   : 'WhisperLog lyssnar igenom ljudet och delar upp texten per röst (Talare 1, 2, 3 …) – lokalt på datorn. Sedan väljer du vem varje röst är.'}
             </p>
           </div>
-          <button className={'btn ' + (hasVoices ? 'sm' : 'primary')} disabled={identifying || m.status === 'processing'} onClick={identify}>
-            {identifying ? <span className="spinner" /> : <IconUsers size={16} />} {hasVoices ? 'Identifiera igen' : 'Identifiera röster'}
-          </button>
+          <div className="identify-actions">
+            <button className={'btn ' + (hasVoices ? 'sm' : 'primary')} disabled={identifying || m.status === 'processing'} onClick={identify}>
+              {identifying ? <span className="spinner" /> : <IconUsers size={16} />} {hasVoices ? 'Identifiera igen' : 'Identifiera röster'}
+            </button>
+            {identFailed && (
+              <button
+                className="btn sm"
+                onClick={() => confirm('Låta Gemini lyssna igenom mötet och skilja på rösterna i stället? Texten transkriberas om.') && api.retranscribe(m.id, false, 'gemini')}
+                title="Fungerar även om röstigenkänningen på datorn inte gör det"
+              >
+                Använd Gemini i stället
+              </button>
+            )}
+          </div>
         </div>
       )}
 
