@@ -12,7 +12,10 @@ En Windows-app (Electron + React) som spelar in möten – digitala på alla pla
   - **Gemini Live** (standard) – transkriberar medan ni pratar; texten är klar i samma stund som mötet slutar.
   - **Gemini** – i efterhand med talaridentifiering och namn på varje röst.
   - **Lokalt (whisper.cpp)** – ljudet lämnar aldrig datorn; används även automatiskt som reserv.
-- **Protokoll** – Gemini skriver protokollet efter mötets agenda och efterliknar tidigare protokoll som du väljer som mall. Redigera, exportera till Word/PDF eller kopiera.
+- **Vem sa vad** – lokal röstigenkänning (sherpa-onnx, WeSpeaker) delar upp texten per röst: Talare 1, 2, 3 … Peka ut vem som pratar under mötet eller efteråt – alla repliker med samma röst får namnet. Fungerar även i efterhand på äldre möten ("Identifiera röster").
+- **Protokoll** – Gemini skriver protokollet efter mötets agenda och följer tidigare protokoll som mall. Roller och bolag hämtas från mötet och mötesuppgifterna. Med en Word-mall (.docx) behålls sidhuvud, sidfot och loggor vid export ("Word enligt mall").
+- **Minnesanteckningar** – eget, lättläst format med sammanfattning, ämnen, beslut och att göra.
+- Redigera, exportera till Word/PDF eller kopiera.
 - **Arkiv** – varje möte sparas med ljud, transkription, protokoll och bilagor.
 
 ## Kom igång

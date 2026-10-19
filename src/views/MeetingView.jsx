@@ -5,7 +5,8 @@ import { fmtDate, fmtDuration, fmtTime, safeFileName, speakerColor, STATUS } fro
 import { mdToDocx, mdToHtml, mdToPrintHtml } from '../lib/markdown';
 import { LivePanel } from '../components/Recording';
 import { MeetingFiles, ModePicker, TemplatePicker } from '../components/Inputs';
-import { IconCopy, IconDownload, IconEdit, IconFolder, IconMic, IconRefresh, IconSpark, IconTrash, IconCheck } from '../components/Icons';
+import { IconCopy, IconDownload, IconEdit, IconFolder, IconMic, IconRefresh, IconSpark, IconTrash, IconCheck, IconUsers } from '../components/Icons';
+import { LiveConversation, SpeakerChip, SpeakerPanel, displayName, nameVoice } from '../components/Speakers';
 
 const api = window.api;
 
@@ -32,7 +33,7 @@ export default function MeetingView({ id }) {
   }, [id, load]);
 
   useEffect(() => {
-    if (m && !tab) setTab(m.hasProtocol ? 'protocol' : m.segments.some((s) => s.transcript?.length) ? 'transcript' : m.status === 'recorded' ? 'transcript' : 'details');
+    if (m && !tab) setTab(m.hasProtocol ? 'protocol' : m.hasNotes ? 'notes' : m.segments.some((s) => s.transcript?.length) ? 'transcript' : m.status === 'recorded' ? 'transcript' : 'details');
   }, [m, tab]);
 
   if (!m) return <div className="page muted">Laddar…</div>;
@@ -87,6 +88,7 @@ export default function MeetingView({ id }) {
       </header>
 
       {isLive && <LivePanel onStopped={() => toast('Mötet är sparat.', 'ok')} />}
+      {isLive && m.liveEnabled && <LiveConversation meeting={m} setM={setM} />}
 
       {!isLive && m.status === 'recorded' && (
         <div className="card start-card">
@@ -118,7 +120,7 @@ export default function MeetingView({ id }) {
       )}
       {m.generatingProtocol && m.status !== 'processing' && (
         <div className="alert info">
-          <span className="spinner" /> Gemini skriver mötesprotokollet…
+          <span className="spinner" /> Gemini skriver {m.generatingKind === 'notes' ? 'minnesanteckningarna' : 'mötesprotokollet'}…
         </div>
       )}
       {m.error && !isLive && m.status !== 'processing' && (
@@ -145,6 +147,9 @@ export default function MeetingView({ id }) {
         <button className={tab === 'protocol' ? 'on' : ''} onClick={() => setTab('protocol')}>
           Protokoll
         </button>
+        <button className={tab === 'notes' ? 'on' : ''} onClick={() => setTab('notes')}>
+          Minnesanteckningar
+        </button>
         <button className={tab === 'transcript' ? 'on' : ''} onClick={() => setTab('transcript')}>
           Transkription
           {segStats.total > 0 && segStats.done < segStats.total && <span className="tab-note">{segStats.done}/{segStats.total}</span>}
@@ -154,7 +159,7 @@ export default function MeetingView({ id }) {
         </button>
       </div>
 
-      {tab === 'protocol' && <ProtocolTab m={m} setM={setM} />}
+      {(tab === 'protocol' || tab === 'notes') && <DocTab m={m} setM={setM} kind={tab} />}
       {tab === 'transcript' && <TranscriptTab m={m} setM={setM} seek={seek} isLive={isLive} />}
       {tab === 'details' && <DetailsTab m={m} setM={setM} update={update} isLive={isLive} />}
     </div>
@@ -183,16 +188,33 @@ function TranscriptTab({ m, setM, seek, isLive }) {
     for (const s of m.segments) (s.transcript || []).forEach((e, i) => out.push({ ...e, seg: s.index, idx: i }));
     return out.sort((a, b) => a.t - b.t);
   }, [m]);
-  const speakers = useMemo(() => [...new Set(entries.map((e) => e.speaker))], [entries]);
-  const [map, setMap] = useState(m.speakerMap || {});
+  const speakers = useMemo(() => {
+    const num = (s) => (/^Talare (\d+)$/.test(s) ? parseInt(s.slice(7)) : 1000);
+    return [...new Set(entries.map((e) => e.speaker))].sort((a, b) => num(a) - num(b));
+  }, [entries]);
+  const counts = useMemo(() => entries.reduce((c, e) => ((c[e.speaker] = (c[e.speaker] || 0) + 1), c), {}), [entries]);
   const [editing, setEditing] = useState(null);
   const [q, setQ] = useState('');
-  useEffect(() => setMap(m.speakerMap || {}), [m.speakerMap]);
+  const [identBusy, setIdentBusy] = useState(false);
 
-  const name = (s) => m.speakerMap?.[s] || s;
-  const saveMap = async () => {
-    setM(await api.updateMeeting(m.id, { speakerMap: map }));
-    toast('Talarnamnen är sparade.', 'ok');
+  const name = (s) => displayName(m, s);
+  const hasVoices = speakers.some((s) => /^Talare \d+$/.test(s));
+  const identifying = m.identifyingVoices != null || identBusy;
+  const identify = async () => {
+    if (hasVoices && !confirm('Identifiera rösterna på nytt? Repliker som du ändrat för hand kan få en ny röst. Namn du satt på rösterna behålls.')) return;
+    setIdentBusy(true);
+    try {
+      setM(await api.identifyVoices(m.id));
+      toast('Klart! Välj nu vem varje röst är.', 'ok');
+    } catch (e) {
+      toast(String(e.message).replace(/^Error invoking remote method '[^']+': (Error: )?/, ''), 'err');
+    } finally {
+      setIdentBusy(false);
+    }
+  };
+  const pickFor = (e) => async (person, { single }) => {
+    if (single) setM(await api.editEntry(m.id, e.seg, e.idx, { speaker: person || e.speaker }));
+    else setM(await nameVoice(m, e.speaker, person));
   };
   const pending = m.segments.filter((s) => s.status !== 'done');
   const shown = q ? entries.filter((e) => e.text.toLowerCase().includes(q.toLowerCase()) || name(e.speaker).toLowerCase().includes(q.toLowerCase())) : entries;
@@ -200,26 +222,25 @@ function TranscriptTab({ m, setM, seek, isLive }) {
 
   return (
     <div className="transcript-wrap">
-      {speakers.length > 0 && (
-        <section className="card speakers">
-          <div className="row-between">
-            <h3>Talare</h3>
-            <span className="muted small">Byt "Talare 1" mot riktiga namn – det används även i protokollet.</span>
+      {entries.length > 0 && !isLive && (
+        <div className={'card identify-card' + (hasVoices ? ' subtle' : '')}>
+          <div>
+            <b>{hasVoices ? 'Rösterna är identifierade' : 'Vem sa vad?'}</b>
+            <p className="muted small">
+              {identifying
+                ? `Lyssnar igenom mötet och känner igen rösterna… ${m.identifyingVoices ?? 0} %`
+                : hasVoices
+                  ? 'Stämmer det inte? Identifiera rösterna på nytt – namnen du satt finns kvar.'
+                  : 'WhisperLog lyssnar igenom ljudet och delar upp texten per röst (Talare 1, 2, 3 …) – lokalt på datorn. Sedan väljer du vem varje röst är.'}
+            </p>
           </div>
-          <div className="speaker-grid">
-            {speakers.map((s) => (
-              <label key={s} className="speaker-row">
-                <span className="swatch" style={{ background: speakerColor(name(s), order) }} />
-                <span className="orig">{s}</span>
-                <input className="input sm" placeholder={s} value={map[s] ?? ''} onChange={(e) => setMap({ ...map, [s]: e.target.value })} />
-              </label>
-            ))}
-          </div>
-          <button className="btn sm" onClick={saveMap}>
-            <IconCheck size={15} /> Spara namn
+          <button className={'btn ' + (hasVoices ? 'sm' : 'primary')} disabled={identifying || m.status === 'processing'} onClick={identify}>
+            {identifying ? <span className="spinner" /> : <IconUsers size={16} />} {hasVoices ? 'Identifiera igen' : 'Identifiera röster'}
           </button>
-        </section>
+        </div>
       )}
+
+      {speakers.length > 0 && <SpeakerPanel meeting={m} setM={setM} labels={speakers} counts={counts} />}
 
       {entries.length > 8 && <input className="input" placeholder="Sök i transkriptionen…" value={q} onChange={(e) => setQ(e.target.value)} />}
 
@@ -232,9 +253,7 @@ function TranscriptTab({ m, setM, seek, isLive }) {
                 {fmtTime(e.t)}
               </button>
               <div className="entry-body">
-                <span className="who" style={{ color: speakerColor(name(e.speaker), order) }}>
-                  {name(e.speaker)}
-                </span>
+                <SpeakerChip meeting={m} label={e.speaker} order={order} allowSingle onPick={pickFor(e)} />
                 {editing === key ? (
                   <textarea
                     className="input"
@@ -294,25 +313,40 @@ function TranscriptTab({ m, setM, seek, isLive }) {
   );
 }
 
-// ------------------------------------------------------------------ Protokoll
-function ProtocolTab({ m, setM }) {
+// ------------------------------------------------------------------ Protokoll / minnesanteckningar
+const DOC_KINDS = {
+  protocol: { title: 'Protokoll', one: 'protokollet', none: 'Inget protokoll ännu', make: 'Skapa protokoll', file: 'Protokoll' },
+  notes: { title: 'Minnesanteckningar', one: 'minnesanteckningarna', none: 'Inga minnesanteckningar ännu', make: 'Skapa minnesanteckningar', file: 'Minnesanteckningar' },
+};
+
+function DocTab({ m, setM, kind }) {
   const { toast } = useApp();
+  const K = DOC_KINDS[kind];
+  const content = m[kind] || '';
+  const has = kind === 'notes' ? m.hasNotes : m.hasProtocol;
+  const generatedAt = kind === 'notes' ? m.notesGeneratedAt : m.protocolGeneratedAt;
   const [editing, setEditing] = useState(false);
-  const [draft, setDraft] = useState(m.protocol);
+  const [draft, setDraft] = useState(content);
   const [busy, setBusy] = useState(false);
   useEffect(() => {
-    if (!editing) setDraft(m.protocol);
-  }, [m.protocol, editing]);
+    if (!editing) setDraft(content);
+  }, [content, editing]);
+  useEffect(() => setEditing(false), [kind]);
   const hasTranscript = m.segments.some((s) => s.transcript?.length);
-  const name = safeFileName(`Protokoll ${m.title}`);
+  const working = busy || (m.generatingProtocol && m.generatingKind === kind);
+  const otherWorking = m.generatingProtocol && m.generatingKind !== kind;
+  const name = safeFileName(`${K.file} ${m.title}`);
+  const unnamed = new Set(m.segments.flatMap((s) => (s.transcript || []).map((e) => e.speaker)).filter((sp) => /^Talare \d+$/.test(sp) && !m.speakerMap?.[sp])).size;
+  const hasTemplates = kind === 'protocol' && (m.templateMeetingIds?.length || m.attachments.some((a) => a.kind === 'template'));
 
   const generate = async () => {
-    if (m.hasProtocol && !confirm('Skriva ett nytt protokoll? Det nuvarande ersätts (inklusive dina ändringar).')) return;
+    if (has && !confirm(`Skapa ${K.one} på nytt? Den nuvarande versionen ersätts (inklusive dina ändringar).`)) return;
+    if (unnamed && !confirm(`${unnamed} röst${unnamed > 1 ? 'er' : ''} saknar namn. Vill du skapa ${K.one} ändå? (Namnge rösterna under Transkription för bäst resultat.)`)) return;
     setBusy(true);
     try {
-      await api.generateProtocol(m.id);
+      await api.generateProtocol(m.id, kind);
       setM(await api.getMeeting(m.id));
-      toast('Protokollet är klart.', 'ok');
+      toast(`${K.title} är klart.`, 'ok');
     } catch (e) {
       toast(e.message.replace(/^Error invoking remote method '[^']+': (Error: )?/, ''), 'err');
     } finally {
@@ -320,24 +354,36 @@ function ProtocolTab({ m, setM }) {
     }
   };
   const save = async () => {
-    setM(await api.saveProtocol(m.id, draft));
+    setM(await api.saveProtocol(m.id, draft, kind));
     setEditing(false);
-    toast('Protokollet är sparat.', 'ok');
+    toast('Sparat.', 'ok');
+  };
+  const exportWord = async (useTemplate) => {
+    try {
+      const buf = await mdToDocx(content, { plainLists: useTemplate });
+      const saved = useTemplate ? await api.exportWordTemplate(m.id, name + '.docx', buf) : await api.exportSave(name + '.docx', buf, [{ name: 'Word', extensions: ['docx'] }]);
+      if (saved) toast(useTemplate ? 'Word-filen är sparad i mallens utseende.' : 'Word-filen är sparad.', 'ok');
+    } catch (e) {
+      toast(e.message.replace(/^Error invoking remote method '[^']+': (Error: )?/, ''), 'err');
+    }
   };
 
-  if (!m.hasProtocol && !editing) {
+  if (!has && !editing) {
     return (
       <div className="card empty-protocol">
         <IconSpark size={28} />
-        <h3>Inget protokoll ännu</h3>
+        <h3>{K.none}</h3>
         <p className="muted">
-          {hasTranscript
-            ? 'Gemini skriver protokollet utifrån transkriptionen' + (m.agendaText || m.attachments.some((a) => a.kind === 'agenda') ? ', agendan' : '') + (m.templateMeetingIds?.length || m.attachments.some((a) => a.kind === 'template') ? ' och dina mallar' : '') + '.'
-            : 'Protokollet kan skrivas när mötet har transkriberats.'}
+          {!hasTranscript
+            ? `${K.title} kan skapas när mötet har transkriberats.`
+            : kind === 'notes'
+              ? 'Gemini skriver egna, lättlästa minnesanteckningar: sammanfattning, vad ni pratade om, beslut och att göra.'
+              : 'Gemini skriver protokollet utifrån transkriptionen' + (m.agendaText || m.attachments.some((a) => a.kind === 'agenda') ? ', agendan' : '') + (hasTemplates ? ' och följer din mall' : '') + '.'}
         </p>
+        {hasTranscript && unnamed > 0 && <p className="small warn-text">Tips: {unnamed} röst{unnamed > 1 ? 'er' : ''} saknar namn – namnge dem under Transkription först, så blir personer och roller rätt.</p>}
         <div className="actions center">
-          <button className="btn primary" disabled={!hasTranscript || busy || m.generatingProtocol} onClick={generate}>
-            {busy || m.generatingProtocol ? <span className="spinner" /> : <IconSpark />} Skapa protokoll
+          <button className="btn primary" disabled={!hasTranscript || working || otherWorking} onClick={generate}>
+            {working ? <span className="spinner" /> : <IconSpark />} {K.make}
           </button>
           <button className="btn ghost" onClick={() => setEditing(true)}>
             Skriv själv
@@ -355,7 +401,7 @@ function ProtocolTab({ m, setM }) {
             <button className="btn primary sm" onClick={save}>
               <IconCheck size={15} /> Spara
             </button>
-            <button className="btn ghost sm" onClick={() => (setEditing(false), setDraft(m.protocol))}>
+            <button className="btn ghost sm" onClick={() => (setEditing(false), setDraft(content))}>
               Avbryt
             </button>
             <span className="muted small">Markdown: # Rubrik, **fet**, - punktlista, | tabell |</span>
@@ -365,23 +411,22 @@ function ProtocolTab({ m, setM }) {
             <button className="btn sm" onClick={() => setEditing(true)}>
               <IconEdit size={15} /> Redigera
             </button>
-            <button className="btn sm" disabled={busy || m.generatingProtocol || !hasTranscript} onClick={generate}>
-              {busy || m.generatingProtocol ? <span className="spinner" /> : <IconRefresh size={15} />} Skapa nytt
+            <button className="btn sm" disabled={working || otherWorking || !hasTranscript} onClick={generate}>
+              {working ? <span className="spinner" /> : <IconRefresh size={15} />} Skapa nytt
             </button>
             <span className="spacer" />
-            <button
-              className="btn sm"
-              onClick={async () => {
-                const buf = await mdToDocx(m.protocol);
-                if (await api.exportSave(name + '.docx', buf, [{ name: 'Word', extensions: ['docx'] }])) toast('Word-filen är sparad.', 'ok');
-              }}
-            >
+            {kind === 'protocol' && m.wordTemplate && (
+              <button className="btn sm primary" onClick={() => exportWord(true)} title={'Använder ' + m.wordTemplate + ' – sidhuvud, sidfot och loggor följer med'}>
+                <IconDownload size={15} /> Word enligt mall
+              </button>
+            )}
+            <button className="btn sm" onClick={() => exportWord(false)}>
               <IconDownload size={15} /> Word
             </button>
             <button
               className="btn sm"
               onClick={async () => {
-                if (await api.exportPdf(name + '.pdf', mdToPrintHtml(m.protocol, m.title))) toast('PDF:en är sparad.', 'ok');
+                if (await api.exportPdf(name + '.pdf', mdToPrintHtml(content, m.title))) toast('PDF:en är sparad.', 'ok');
               }}
             >
               <IconDownload size={15} /> PDF
@@ -389,10 +434,8 @@ function ProtocolTab({ m, setM }) {
             <button
               className="btn sm"
               onClick={async () => {
-                const html = mdToHtml(m.protocol);
-                await navigator.clipboard.write([
-                  new ClipboardItem({ 'text/html': new Blob([html], { type: 'text/html' }), 'text/plain': new Blob([m.protocol], { type: 'text/plain' }) }),
-                ]);
+                const html = mdToHtml(content);
+                await navigator.clipboard.write([new ClipboardItem({ 'text/html': new Blob([html], { type: 'text/html' }), 'text/plain': new Blob([content], { type: 'text/plain' }) })]);
                 toast('Kopierat – klistra in i Word eller e-post.', 'ok');
               }}
             >
@@ -401,15 +444,18 @@ function ProtocolTab({ m, setM }) {
           </>
         )}
       </div>
+      {kind === 'protocol' && hasTemplates && !m.wordTemplate && !editing && (
+        <p className="muted small">Vill du ha mallens loggor, sidhuvud och sidfot i Word? Bifoga det tidigare protokollet som Word-fil (.docx) under "Underlag & filer" – då dyker knappen "Word enligt mall" upp.</p>
+      )}
       {editing ? (
         <div className="editor-split">
           <textarea className="input editor" value={draft} onChange={(e) => setDraft(e.target.value)} spellCheck />
           <div className="doc" dangerouslySetInnerHTML={{ __html: mdToHtml(draft) }} />
         </div>
       ) : (
-        <div className="doc" dangerouslySetInnerHTML={{ __html: mdToHtml(m.protocol) }} />
+        <div className="doc" dangerouslySetInnerHTML={{ __html: mdToHtml(content) }} />
       )}
-      {m.protocolGeneratedAt && !editing && <p className="muted small">Skapat av Gemini {fmtDate(m.protocolGeneratedAt)}</p>}
+      {generatedAt && !editing && <p className="muted small">Skapat av Gemini {fmtDate(generatedAt)}</p>}
     </div>
   );
 }
@@ -417,8 +463,8 @@ function ProtocolTab({ m, setM }) {
 // ------------------------------------------------------------------ Underlag
 function DetailsTab({ m, setM, update, isLive }) {
   const { toast } = useApp();
-  const [f, setF] = useState({ participants: m.participants, agendaText: m.agendaText, instructions: m.instructions, templateMeetingIds: m.templateMeetingIds || [], mode: m.mode });
-  const dirty = ['participants', 'agendaText', 'instructions', 'mode'].some((k) => f[k] !== m[k]) || JSON.stringify(f.templateMeetingIds) !== JSON.stringify(m.templateMeetingIds || []);
+  const [f, setF] = useState({ participants: m.participants, organization: m.organization || '', agendaText: m.agendaText, instructions: m.instructions, templateMeetingIds: m.templateMeetingIds || [], mode: m.mode });
+  const dirty = ['participants', 'organization', 'agendaText', 'instructions', 'mode'].some((k) => f[k] !== m[k]) || JSON.stringify(f.templateMeetingIds) !== JSON.stringify(m.templateMeetingIds || []);
   const save = async () => {
     await update(f);
     toast('Underlaget är sparat.', 'ok');
@@ -436,7 +482,11 @@ function DetailsTab({ m, setM, update, isLive }) {
       <section className="card">
         <label className="field">
           <span>Deltagare</span>
-          <input className="input" value={f.participants} onChange={(e) => setF({ ...f, participants: e.target.value })} placeholder="Namn, separerade med komma" />
+          <input className="input" value={f.participants} onChange={(e) => setF({ ...f, participants: e.target.value })} placeholder="Namn (roll), separerade med komma – t.ex. Jonas Denzler (ordförande), Anna Berg (sekreterare)" />
+        </label>
+        <label className="field">
+          <span>Bolag / organisation</span>
+          <input className="input" value={f.organization} onChange={(e) => setF({ ...f, organization: e.target.value })} placeholder="t.ex. Exempelbolaget AB" />
         </label>
       </section>
       <section className="card">

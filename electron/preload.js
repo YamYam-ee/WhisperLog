@@ -28,6 +28,7 @@ contextBridge.exposeInMainWorld('api', {
   finalize: invoke('meetings:finalize'),
   transcribe: invoke('meetings:transcribe'),
   retranscribe: invoke('meetings:retranscribe'),
+  identifyVoices: invoke('meetings:identifyVoices'),
   openStorageRoot: invoke('storage:openRoot'),
   importAudio: invoke('import:audio'),
 
@@ -35,6 +36,7 @@ contextBridge.exposeInMainWorld('api', {
   saveProtocol: invoke('protocol:save'),
   exportSave: invoke('export:save'),
   exportPdf: invoke('export:pdf'),
+  exportWordTemplate: invoke('export:wordTemplate'),
 
   rec: {
     begin: invoke('rec:begin'),

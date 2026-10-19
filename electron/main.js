@@ -26,6 +26,8 @@ const gemini = require('./gemini');
 const { MeetingDetector } = require('./detector');
 const localWhisper = require('./localWhisper');
 const { LiveMeeting } = require('./liveTranscriber');
+const voices = require('./voices');
+const { fillTemplate } = require('./wordTemplate');
 
 const DEV_URL = process.env.VITE_DEV_SERVER_URL;
 const ASSETS = path.join(__dirname, '..', 'assets');
@@ -388,13 +390,230 @@ async function withModel(kind, fn) {
 // ---------------------------------------------------------------- Gemini Live (under mötet)
 const lives = new Map(); // meetingId -> LiveMeeting
 
+// Röstgruppering per möte: avtryck i minnet (sparas även i voices.json i mötesmappen).
+const voiceStates = new Map();
+
+function voiceStateFor(id) {
+  if (!voiceStates.has(id)) {
+    const file = path.join(storage.meetingDir(id), 'voices.json');
+    let saved = { items: [] };
+    try {
+      saved = JSON.parse(fs.readFileSync(file, 'utf8'));
+    } catch {
+      /* nytt möte */
+    }
+    const m = storage.load(id);
+    voiceStates.set(id, {
+      file,
+      items: saved.items || [],
+      seq: Math.max(0, ...(m.liveEntries || []).map((e) => e.id || 0)),
+      saveTimer: null,
+    });
+  }
+  return voiceStates.get(id);
+}
+
+function saveVoicesSoon(st) {
+  clearTimeout(st.saveTimer);
+  st.saveTimer = setTimeout(() => {
+    try {
+      fs.writeFileSync(st.file, JSON.stringify({ items: st.items.map((it) => ({ ...it, emb: it.emb.map((x) => +x.toFixed(4)) })) }));
+    } catch (e) {
+      console.warn('Kunde inte spara röstavtryck', e.message);
+    }
+  }, 5000);
+}
+
+// Räknar ut röstavtryck för en ny replik (i 6-sekundersbitar, så att talarbyten inom en lång
+// replik fångas) och grupperar om alla röster i mötet.
+function identifyVoice(id, entry, track) {
+  if (!voices.ready()) return;
+  try {
+    const st = voiceStateFor(id);
+    const to = entry.end - 0.3;
+    const from = Math.max(entry.t, to - 118); // ljudhistoriken räcker ~2 min bakåt
+    // Eko: hörs datorljudet starkare än mikrofonen är mikrofonens ljud ett eko från högtalarna.
+    const other = entry.track === 'mic' ? lives.get(id)?.tracks.system : null;
+    const level = (pcm) => {
+      let sum = 0;
+      for (let i = 0; i < pcm.length; i++) sum += pcm[i] * pcm[i];
+      return pcm.length ? Math.sqrt(sum / pcm.length) : 0;
+    };
+    let k = 0;
+    for (let s = from; s < to - 1; s += 6, k++) {
+      const e = Math.min(s + 6, to);
+      const pcm = track.audio(s, e);
+      if (other && level(other.audio(s, e)) > level(pcm) * 0.6) continue;
+      const emb = voices.embed(pcm);
+      if (emb) st.items.push({ id: entry.id + ':' + k, entry: entry.id, from: s, to: e, emb, track: entry.track });
+    }
+    if (!st.items.some((it) => it.entry === entry.id)) return;
+    const { labels } = voices.cluster(st.items, reservedLabels(id));
+    for (const it of st.items) it.voice = labels.get(it.id);
+    // Per replik: röst per tidsbit + den röst som hörs mest.
+    const parts = new Map();
+    for (const it of st.items) {
+      if (!parts.has(it.entry)) parts.set(it.entry, []);
+      parts.get(it.entry).push({ from: Math.round(it.from * 10) / 10, to: Math.round(it.to * 10) / 10, voice: it.voice });
+    }
+    storage.update(id, (m) => {
+      for (const le of m.liveEntries || []) {
+        const p = parts.get(le.id);
+        if (!p) continue;
+        le.voiceParts = p;
+        const dur = {};
+        for (const x of p) dur[x.voice] = (dur[x.voice] || 0) + (x.to - x.from);
+        le.voice = Object.entries(dur).sort((a, b) => b[1] - a[1])[0][0];
+      }
+    });
+    saveVoicesSoon(st);
+  } catch (e) {
+    console.warn('Röstigenkänning misslyckades:', e.message);
+  }
+}
+
+// Etiketter som användaren gett namn – återanvänds aldrig för en annan röst.
+function reservedLabels(id) {
+  const m = storage.load(id);
+  return new Set(Object.keys(m.speakerMap || {}).filter((k) => /^Talare \d+$/.test(k) && m.speakerMap[k]));
+}
+
+function readPcm(file) {
+  const b = fs.readFileSync(file).subarray(44);
+  return new Int16Array(b.buffer.slice(b.byteOffset, b.byteOffset + b.length - (b.length % 2)));
+}
+
+function rms(pcm, from, to) {
+  if (!pcm) return 0;
+  let e = 0;
+  const a = Math.max(0, Math.round(from * 16000));
+  const b = Math.min(pcm.length, Math.round(to * 16000));
+  for (let i = a; i < b; i++) e += pcm[i] * pcm[i];
+  return b > a ? Math.sqrt(e / (b - a)) : 0;
+}
+
+/**
+ * Röstidentifiering i efterhand för ett redan transkriberat möte (eller vissa segment).
+ * Räknar röstavtryck i 6-sekundersbitar ur ljudfilerna, grupperar dem tillsammans med eventuella
+ * Live-avtryck och delar texten per mening och röst → Talare 1, 2, 3 … i hela mötet.
+ */
+const identifying = new Set();
+async function identifyVoicesPostHoc(id, { only = null } = {}) {
+  if (identifying.has(id)) throw new Error('Röstidentifiering pågår redan för mötet');
+  identifying.add(id);
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'whisperlog-voices-'));
+  try {
+    await voices.ensureModel();
+    const m = storage.load(id);
+    const st = voiceStateFor(id);
+    const segs = m.segments.filter((s) => s.transcript?.length && (!only || only.includes(s.index)));
+    const totalSec = segs.reduce((n, s) => n + (s.durationSec || 0), 0) || 1;
+    let doneSec = 0;
+    storage.update(id, { identifyingVoices: 0 });
+    const newItems = [];
+    for (const s of segs) {
+      const read = async (key) => {
+        const rel = s.files?.[key];
+        if (!rel) return null;
+        const src = storage.resolveInMeeting(id, rel);
+        if (!fs.existsSync(src) || fs.statSync(src).size < 2000) return null;
+        const wav = path.join(tmp, s.index + '-' + key + '.wav');
+        await audio.toWav16k(src, wav);
+        return readPcm(wav);
+      };
+      const mic = await read('mic');
+      const sys = await read('system');
+      const mix = (await read('mix')) || mic || sys;
+      if (!mix) continue;
+      const rows = s.transcript.slice().sort((a, b) => a.t - b.t);
+      const segEnd = s.startOffset + (s.durationSec || mix.length / 16000);
+      for (let i = 0; i < rows.length; i++) {
+        const from = rows[i].t - s.startOffset;
+        const to = Math.min((rows[i + 1]?.t ?? segEnd) - s.startOffset, from + 120, mix.length / 16000);
+        for (let a = Math.max(0, from), k = 0; a < to - 1; a += 6, k++) {
+          const b = Math.min(a + 6, to);
+          const emb = voices.embed(mix.subarray(Math.round(a * 16000), Math.round(b * 16000)));
+          if (emb) {
+            const track = mic && sys ? (rms(mic, a, b) >= rms(sys, a, b) ? 'mic' : 'system') : mic ? 'mic' : 'system';
+            newItems.push({ id: 'p' + s.index + ':' + i + ':' + k, entry: 'p' + s.index + ':' + i, from: s.startOffset + a, to: s.startOffset + b, emb, track });
+          }
+          await new Promise((r) => setImmediate(r)); // håll appen responsiv
+        }
+        doneSec = Math.min(totalSec, doneSec + (to - from));
+        storage.update(id, { identifyingVoices: Math.round((100 * doneSec) / totalSec) });
+      }
+    }
+    // Ersätt tidigare efterhandsavtryck för dessa segment och gruppera allt tillsammans.
+    const segPrefixes = segs.map((s) => 'p' + s.index + ':');
+    // Behåll etiketterna (och därmed namnen) från en tidigare identifiering: nya bitar ärver
+    // rösten från den gamla biten på samma tidpunkt, så att grupperingen matchar dem.
+    const old = st.items.filter((it) => segPrefixes.some((p) => String(it.id).startsWith(p)));
+    for (const it of newItems) {
+      const prev = old.find((o) => Math.abs(o.from - it.from) < 3 && o.voice);
+      if (prev) it.voice = prev.voice;
+    }
+    st.items = st.items.filter((it) => !segPrefixes.some((p) => String(it.id).startsWith(p))).concat(newItems);
+    const { labels } = voices.cluster(st.items, reservedLabels(id));
+    for (const it of st.items) it.voice = labels.get(it.id);
+    saveVoicesSoon(st);
+
+    storage.update(id, (mm) => {
+      for (const s of mm.segments) {
+        if (!segs.some((x) => x.index === s.index)) continue;
+        const rows = s.transcript.slice().sort((a, b) => a.t - b.t);
+        const segEnd = s.startOffset + (s.durationSec || 0);
+        s.transcript = rows.flatMap((e, i) => {
+          const parts = st.items.filter((it) => it.entry === 'p' + s.index + ':' + i).map((it) => ({ from: it.from, to: it.to, voice: it.voice }));
+          if (!parts.length) return [e];
+          const dur = {};
+          for (const p of parts) dur[p.voice] = (dur[p.voice] || 0) + (p.to - p.from);
+          const voice = Object.entries(dur).sort((a, b) => b[1] - a[1])[0][0];
+          return splitByVoice({ t: e.t, end: rows[i + 1]?.t ?? segEnd, text: e.text, voice, voiceParts: parts }).map((p) => ({ t: p.t, speaker: p.voice, text: p.text }));
+        });
+        s.voicesIdentified = true;
+      }
+      // Live-repliker får också de omräknade etiketterna.
+      for (const le of mm.liveEntries || []) {
+        const p = st.items.filter((it) => it.entry === le.id);
+        if (!p.length) continue;
+        le.voiceParts = p.map((it) => ({ from: it.from, to: it.to, voice: it.voice }));
+        const dur = {};
+        for (const x of le.voiceParts) dur[x.voice] = (dur[x.voice] || 0) + (x.to - x.from);
+        le.voice = Object.entries(dur).sort((a, b) => b[1] - a[1])[0][0];
+      }
+      // Digitalt möte: rösten som mest hörs i mikrofonen är du.
+      if (mm.mode !== 'physical' && settings.userName) {
+        const micDur = {};
+        for (const it of st.items) if (it.track === 'mic' && it.voice) micDur[it.voice] = (micDur[it.voice] || 0) + (it.to - it.from);
+        const top = Object.entries(micDur).sort((a, b) => b[1] - a[1])[0];
+        mm.speakerMap = mm.speakerMap || {};
+        if (top && !mm.speakerMap[top[0]]) mm.speakerMap[top[0]] = settings.userName;
+      }
+      mm.identifyingVoices = null;
+    });
+    applyLiveEntries(id, { onlyLive: true });
+    return meetingFull(id);
+  } catch (e) {
+    storage.update(id, { identifyingVoices: null });
+    throw e;
+  } finally {
+    identifying.delete(id);
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
 function liveFor(id) {
   if (!lives.has(id)) {
     lives.set(
       id,
       new LiveMeeting({
         apiKey: getApiKey(),
-        onEntry: (e) => storage.update(id, (m) => (m.liveEntries = m.liveEntries || []).push(e)),
+        onEntry: (e, track) => {
+          const st = voiceStateFor(id);
+          e.id = ++st.seq;
+          storage.update(id, (m) => (m.liveEntries = m.liveEntries || []).push(e));
+          setImmediate(() => identifyVoice(id, e, track));
+        },
         onGap: (track, at) => storage.update(id, (m) => (m.liveGaps = m.liveGaps || []).push({ track, at })),
       })
     );
@@ -402,24 +621,59 @@ function liveFor(id) {
   return lives.get(id);
 }
 
+// Delar en Live-replik i meningar och ger varje mening rösten som hördes vid den tidpunkten
+// (texten fördelas jämnt över replikens tid). Sammanhängande meningar med samma röst slås ihop.
+function splitByVoice(e) {
+  const parts = e.voiceParts || [];
+  if (new Set(parts.map((p) => p.voice)).size < 2) return [{ t: e.t, voice: e.voice, text: e.text }];
+  const sentences = e.text.match(/[^.!?]+[.!?]*\s*/g) || [e.text];
+  const total = e.text.length || 1;
+  const dur = Math.max(1, (e.end || e.t + 1) - e.t);
+  const mid = (p) => (p.from + p.to) / 2;
+  const out = [];
+  let pos = 0;
+  for (const s of sentences) {
+    const startT = e.t + (pos / total) * dur;
+    const at = e.t + ((pos + s.length / 2) / total) * dur;
+    pos += s.length;
+    const p = parts.find((x) => at >= x.from && at < x.to) || parts.reduce((a, b) => (Math.abs(mid(a) - at) <= Math.abs(mid(b) - at) ? a : b));
+    const last = out[out.length - 1];
+    if (last && last.voice === p.voice) last.text += s;
+    else out.push({ t: startT, voice: p.voice, text: s });
+  }
+  return out.map((o) => ({ ...o, t: Math.round(o.t * 10) / 10, text: o.text.trim() })).filter((o) => o.text);
+}
+
 // Fördelar Live-texten på segmenten. Segment där anslutningen bröts markeras för
 // vanlig transkribering i efterhand.
-function applyLiveEntries(id) {
+function applyLiveEntries(id, { onlyLive = false } = {}) {
   storage.update(id, (m) => {
+    if (onlyLive && !(m.liveEntries || []).length) return;
     const entries = (m.liveEntries || []).slice().sort((a, b) => a.t - b.t);
     const gaps = m.liveGaps || [];
     const label = m.mode === 'physical' ? { mic: 'Deltagare' } : { mic: settings.userName || 'Jag', system: 'Övriga deltagare' };
+    // Digitala möten: rösten som främst hörs i mikrofonen är du – få ditt namn om den inte namngetts.
+    if (m.mode !== 'physical' && settings.userName) {
+      const micCount = {};
+      for (const e of entries) if (e.voice && e.track === 'mic') micCount[e.voice] = (micCount[e.voice] || 0) + 1;
+      const top = Object.entries(micCount).sort((a, b) => b[1] - a[1])[0];
+      m.speakerMap = m.speakerMap || {};
+      if (top && !m.speakerMap[top[0]]) m.speakerMap[top[0]] = settings.userName;
+    }
     m.segments.forEach((s, i) => {
       const start = s.startOffset;
       const end = start + (s.durationSec || 0);
       const isLast = i === m.segments.length - 1;
+      if (onlyLive && (s.engine !== 'live' || s.voicesIdentified)) return;
       if (gaps.some((g) => g.at >= start - 1 && g.at < end + 1)) {
         s.status = 'pending';
         return;
       }
       const mine = entries
         .filter((e) => e.t >= start - 0.5 && (e.t < end || isLast) && label[e.track])
-        .map((e) => ({ t: Math.max(start, e.t), end: e.t + e.text.split(/\s+/).length / 2.5, speaker: label[e.track], text: e.text, track: e.track }));
+        .flatMap((e) =>
+          splitByVoice(e).map((p) => ({ t: Math.max(start, p.t), end: p.t + p.text.split(/\s+/).length / 2.5, speaker: p.voice || label[e.track], text: p.text, track: e.track }))
+        );
       s.transcript = cleanupEntries(mine);
       s.status = 'done';
       s.engine = 'live';
@@ -664,6 +918,11 @@ async function finalizeMeeting(id, { transcribe = true, engine = settings.transc
   }
   await (queues.get(id) || Promise.resolve());
   audioDone.then(() => send('meeting:updated', id));
+  {
+    const mm = storage.load(id);
+    const redone = mm.liveEnabled ? mm.segments.filter((s) => s.status === 'done' && s.engine && s.engine !== 'live' && !s.voicesIdentified).map((s) => s.index) : [];
+    if (redone.length && voices.ready()) await identifyVoicesPostHoc(id, { only: redone }).catch((e) => console.warn('Röstidentifiering i efterhand misslyckades:', e.message));
+  }
   const m = storage.load(id);
   const failed = m.segments.filter((s) => s.status === 'error');
   if (failed.length) {
@@ -691,10 +950,10 @@ function openMeeting(id) {
 }
 
 const generating = new Set();
-async function generateProtocol(id) {
-  if (generating.has(id)) throw new Error('Protokollet genereras redan');
+async function generateProtocol(id, kind = 'protocol') {
+  if (generating.has(id)) throw new Error('Ett dokument skapas redan för mötet');
   generating.add(id);
-  storage.update(id, { generatingProtocol: true, error: null });
+  storage.update(id, { generatingProtocol: true, generatingKind: kind, error: null });
   try {
     const m = storage.load(id);
     const attachments = (kind) =>
@@ -718,12 +977,13 @@ async function generateProtocol(id) {
       templateFiles: attachments('template'),
       templateTexts,
       userName: settings.userName,
+      kind,
     }));
-    storage.writeProtocol(id, md, true);
+    storage.writeDoc(id, kind, md, true);
     return md;
   } finally {
     generating.delete(id);
-    storage.update(id, { generatingProtocol: false });
+    storage.update(id, { generatingProtocol: false, generatingKind: null });
   }
 }
 
@@ -767,7 +1027,13 @@ function registerMediaProtocol() {
 function meetingFull(id) {
   const m = storage.load(id);
   if (!m) return null;
-  return { ...m, protocol: storage.readProtocol(id), dir: storage.meetingDir(id) };
+  return {
+    ...m,
+    protocol: storage.readDoc(id, 'protocol'),
+    notes: storage.readDoc(id, 'notes'),
+    wordTemplate: (m.attachments || []).find((a) => a.kind === 'template' && /\.docx$/i.test(a.name))?.name || null,
+    dir: storage.meetingDir(id),
+  };
 }
 
 function registerIpc() {
@@ -821,18 +1087,24 @@ function registerIpc() {
   h('meetings:get', (id) => meetingFull(id));
   h('meetings:create', (data) => meetingFull(storage.create(data).id));
   h('meetings:update', (id, patch) => {
-    const allowed = ['title', 'participants', 'agendaText', 'instructions', 'templateMeetingIds', 'speakerMap', 'mode'];
+    const allowed = ['title', 'participants', 'organization', 'agendaText', 'instructions', 'templateMeetingIds', 'speakerMap', 'mode'];
     const clean = Object.fromEntries(Object.entries(patch).filter(([k]) => allowed.includes(k)));
     storage.update(id, clean);
     return meetingFull(id);
   });
-  h('meetings:editEntry', (id, segIndex, entryIndex, text) => {
+  // change = ny text (sträng) eller { text?, speaker? } – speaker ändrar bara denna replik.
+  h('meetings:editEntry', (id, segIndex, entryIndex, change) => {
+    const patch = typeof change === 'string' ? { text: change } : change || {};
     storage.update(id, (m) => {
       const s = m.segments.find((x) => x.index === segIndex);
-      if (s?.transcript?.[entryIndex]) s.transcript[entryIndex].text = text;
+      const e = s?.transcript?.[entryIndex];
+      if (!e) return;
+      if (typeof patch.text === 'string') e.text = patch.text;
+      if (patch.speaker) e.speaker = patch.speaker;
     });
     return meetingFull(id);
   });
+  h('meetings:identifyVoices', (id) => identifyVoicesPostHoc(id));
   h('meetings:delete', async (id) => {
     const dir = storage.remove(id);
     await shell.trashItem(dir); // till papperskorgen, inte permanent radering
@@ -881,10 +1153,22 @@ function registerIpc() {
     return localWhisper.status();
   });
 
-  h('protocol:generate', (id) => generateProtocol(id));
-  h('protocol:save', (id, md) => {
-    storage.writeProtocol(id, md);
+  h('protocol:generate', (id, kind) => generateProtocol(id, kind || 'protocol'));
+  h('protocol:save', (id, md, kind) => {
+    storage.writeDoc(id, kind || 'protocol', md);
     return meetingFull(id);
+  });
+  // Word enligt mallen: fyller mötets Word-mall (sidhuvud, sidfot, loggor) med det nya innehållet.
+  h('export:wordTemplate', async (id, defaultName, generated) => {
+    const m = storage.load(id);
+    const tpl = m.attachments.find((a) => a.kind === 'template' && /\.docx$/i.test(a.name));
+    if (!tpl) throw new Error('Mötet har ingen Word-mall bifogad');
+    const buf = await fillTemplate(storage.resolveInMeeting(id, tpl.file), generated);
+    const r = await dialog.showSaveDialog(win, { defaultPath: path.join(app.getPath('documents'), defaultName), filters: [{ name: 'Word', extensions: ['docx'] }] });
+    if (r.canceled) return null;
+    fs.writeFileSync(r.filePath, buf);
+    shell.showItemInFolder(r.filePath);
+    return r.filePath;
   });
 
   // --- Inspelning (renderer skickar ljudbitar löpande så att inget går förlorat vid krasch)
@@ -1041,6 +1325,8 @@ app.whenReady().then(() => {
   setupLogging();
   loadSettings();
   localWhisper.init(path.join(app.getPath('userData'), 'whisper'));
+  voices.init(path.join(app.getPath('userData'), 'voices'));
+  voices.ensureModel().catch((e) => console.warn('Röstmodellen kunde inte laddas ner:', e.message));
   storage.setBaseDir(settings.storageDir);
   recoverInterrupted();
   storage.events.on('updated', (id) => send('meeting:updated', id));

@@ -75,6 +75,7 @@ function create(data) {
     mode: data.mode === 'physical' ? 'physical' : 'digital',
     source: data.source || 'recording',
     participants: data.participants || '',
+    organization: data.organization || '',
     agendaText: data.agendaText || '',
     instructions: data.instructions || '',
     templateMeetingIds: data.templateMeetingIds || [],
@@ -210,19 +211,30 @@ function writeTranscriptText(m) {
   }
 }
 
-function readProtocol(id) {
-  const f = path.join(meetingDir(id), 'protocol.md');
+// Dokument per möte: protokoll (protocol.md) och minnesanteckningar (notes.md).
+const DOC_FILES = { protocol: 'protocol.md', notes: 'notes.md' };
+
+function readDoc(id, kind = 'protocol') {
+  const f = path.join(meetingDir(id), DOC_FILES[kind] || DOC_FILES.protocol);
   return fs.existsSync(f) ? fs.readFileSync(f, 'utf8') : '';
 }
 
-function writeProtocol(id, md, generated = false) {
-  fs.writeFileSync(path.join(meetingDir(id), 'protocol.md'), md, 'utf8');
+function writeDoc(id, kind, md, generated = false) {
+  fs.writeFileSync(path.join(meetingDir(id), DOC_FILES[kind] || DOC_FILES.protocol), md, 'utf8');
   return update(id, (m) => {
-    m.hasProtocol = !!md.trim();
-    if (generated) m.protocolGeneratedAt = new Date().toISOString();
-    if (m.status === 'transcribed' && m.hasProtocol) m.status = 'done';
+    if (kind === 'notes') {
+      m.hasNotes = !!md.trim();
+      if (generated) m.notesGeneratedAt = new Date().toISOString();
+    } else {
+      m.hasProtocol = !!md.trim();
+      if (generated) m.protocolGeneratedAt = new Date().toISOString();
+    }
+    if (m.status === 'transcribed' && (m.hasProtocol || m.hasNotes)) m.status = 'done';
   });
 }
+
+const readProtocol = (id) => readDoc(id, 'protocol');
+const writeProtocol = (id, md, generated) => writeDoc(id, 'protocol', md, generated);
 
 module.exports = {
   events,
@@ -242,5 +254,7 @@ module.exports = {
   transcriptAsText,
   readProtocol,
   writeProtocol,
+  readDoc,
+  writeDoc,
   fmtTime,
 };

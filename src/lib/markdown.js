@@ -97,8 +97,9 @@ function blocks(tokens, ctx = {}) {
             } else if (child.type === 'text' || child.type === 'paragraph') {
               const check = item.task ? (item.checked ? '☑ ' : '☐ ') : '';
               const children = [new TextRun(first ? prefix + check : ''), ...inline(child.tokens || [child])];
+              if (ctx.plainLists && !t.ordered) children.unshift(new TextRun(first ? '•\t' : '\t'));
               out.push(
-                t.ordered
+                t.ordered || ctx.plainLists
                   ? new Paragraph({ children, indent: { left: 360 * (level + 1), hanging: 260 }, spacing: { after: 60 } })
                   : new Paragraph({ children, bullet: { level }, spacing: { after: 60 } })
               );
@@ -144,12 +145,13 @@ function blocks(tokens, ctx = {}) {
   return out;
 }
 
-export async function mdToDocx(md) {
+// plainLists: punktlistor som vanlig text (•) – används när innehållet läggs in i en Word-mall.
+export async function mdToDocx(md, { plainLists = false } = {}) {
   const doc = new Document({
     styles: {
       default: { document: { run: { font: 'Calibri', size: 22 } } },
     },
-    sections: [{ properties: {}, children: blocks(marked.lexer(md || '')) }],
+    sections: [{ properties: {}, children: blocks(marked.lexer(md || ''), { plainLists }) }],
   });
   const blob = await Packer.toBlob(doc);
   return blob.arrayBuffer();

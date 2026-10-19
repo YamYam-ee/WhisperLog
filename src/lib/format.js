@@ -39,6 +39,40 @@ export function speakerColor(name, order) {
   return PALETTE[h % PALETTE.length];
 }
 
+// Delar en Live-replik i meningar och ger varje mening rösten som hördes vid den tidpunkten
+// (texten fördelas jämnt över replikens tid). Sammanhängande meningar med samma röst slås ihop.
+export function splitByVoice(e) {
+  const parts = e.voiceParts || [];
+  if (new Set(parts.map((p) => p.voice)).size < 2) return [{ t: e.t, voice: e.voice, text: e.text }];
+  const sentences = e.text.match(/[^.!?]+[.!?]*\s*/g) || [e.text];
+  const total = e.text.length || 1;
+  const dur = Math.max(1, (e.end || e.t + 1) - e.t);
+  const mid = (p) => (p.from + p.to) / 2;
+  const out = [];
+  let pos = 0;
+  for (const s of sentences) {
+    const startT = e.t + (pos / total) * dur;
+    const at = e.t + ((pos + s.length / 2) / total) * dur;
+    pos += s.length;
+    const p = parts.find((x) => at >= x.from && at < x.to) || parts.reduce((a, b) => (Math.abs(mid(a) - at) <= Math.abs(mid(b) - at) ? a : b));
+    const last = out[out.length - 1];
+    if (last && last.voice === p.voice) last.text += s;
+    else out.push({ t: startT, voice: p.voice, text: s });
+  }
+  return out.map((o) => ({ ...o, t: Math.round(o.t * 10) / 10, text: o.text.trim() })).filter((o) => o.text);
+}
+
+// Ord-överlapp mellan två texter (0–1) – för att känna igen eko av högtalarljud i mikrofonen.
+export function similarity(a, b) {
+  const words = (s) => new Set(String(s).toLowerCase().replace(/[^\p{L}\p{N} ]/gu, '').split(/\s+/).filter((w) => w.length > 2));
+  const A = words(a);
+  const B = words(b);
+  if (!A.size || !B.size) return 0;
+  let n = 0;
+  for (const w of A) if (B.has(w)) n++;
+  return n / Math.min(A.size, B.size);
+}
+
 export function safeFileName(s) {
   return String(s || 'protokoll').replace(/[\\/:*?"<>|]+/g, '-').trim().slice(0, 80);
 }

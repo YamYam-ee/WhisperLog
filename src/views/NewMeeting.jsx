@@ -13,6 +13,7 @@ export default function NewMeeting() {
     title: '',
     mode: 'digital',
     participants: '',
+    organization: '',
     agendaText: '',
     instructions: '',
     templateMeetingIds: [],
@@ -79,7 +80,12 @@ export default function NewMeeting() {
         <ModePicker value={f.mode} onChange={set('mode')} />
         <label className="field">
           <span>Deltagare</span>
-          <input className="input" placeholder="Namn, separerade med komma – hjälper Gemini att sätta rätt namn på talarna" value={f.participants} onChange={set('participants')} />
+          <input className="input" placeholder="Namn (roll), t.ex. Jonas Denzler (ordförande), Anna Berg (sekreterare)" value={f.participants} onChange={set('participants')} />
+          <small className="muted">Under mötet kan du välja bland deltagarna när du pekar ut vem som pratar.</small>
+        </label>
+        <label className="field">
+          <span>Bolag / organisation</span>
+          <input className="input" placeholder="Används i protokollet" value={f.organization} onChange={set('organization')} />
         </label>
       </section>
 

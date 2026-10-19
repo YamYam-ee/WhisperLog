@@ -297,8 +297,10 @@ async function fileToParts(ai, file, uploadedList) {
   const ext = path.extname(file.path).toLowerCase();
   if (ext === '.docx') {
     const mammoth = require('mammoth');
-    const { value } = await mammoth.extractRawText({ path: file.path });
-    return [`--- ${file.name} ---\n${value}`];
+    // HTML behåller rubriker, tabeller och fetstil – så att Gemini kan efterlikna strukturen.
+    const { value } = await mammoth.convertToHtml({ path: file.path });
+    const html = value.replace(/<img[^>]*>/g, '[logotyp/bild]');
+    return ['--- ' + file.name + ' (Word-dokument som HTML) ---\n' + html];
   }
   if (TEXT_EXT.has(ext)) return [`--- ${file.name} ---\n${fs.readFileSync(file.path, 'utf8')}`];
   if (MIME[ext]) {
@@ -310,50 +312,84 @@ async function fileToParts(ai, file, uploadedList) {
 }
 
 /**
- * Skapar ett mötesprotokoll i Markdown.
+ * Skapar ett mötesprotokoll (kind = 'protocol') eller minnesanteckningar (kind = 'notes') i Markdown.
  * agendaFiles / templateFiles: [{name, path}], templateTexts: [{name, text}]
  */
-async function generateProtocol({ apiKey, models, meeting, transcriptText, agendaFiles, templateFiles, templateTexts, userName }) {
+async function generateProtocol({ apiKey, models, meeting, transcriptText, agendaFiles, templateFiles, templateTexts, userName, kind = 'protocol' }) {
   const ai = client(apiKey);
   const uploaded = [];
+  const notes = kind === 'notes';
   try {
     const date = new Date(meeting.startedAt || meeting.createdAt);
     const hasAgenda = !!(meeting.agendaText?.trim() || agendaFiles.length);
-    const hasTemplates = !!(templateFiles.length || templateTexts.length);
+    // Minnesanteckningar har en egen enkel form – mallarna gäller bara protokoll.
+    const hasTemplates = !notes && !!(templateFiles.length || templateTexts.length);
 
-    const parts = [
-      [
-        'Du är en erfaren mötessekreterare. Skriv ett professionellt mötesprotokoll på svenska utifrån transkriptionen nedan.',
-        '',
-        'Krav:',
-        '- Svara ENDAST med protokollet i Markdown (inga förklaringar före eller efter, inga kodblock runt).',
-        '- Skriv protokollet på korrekt, professionell svenska – även när delar av mötet hölls på engelska. Sammanfatta engelska inlägg på svenska; etablerade engelska fackuttryck och namn får stå kvar.',
-        '- Stava deltagarnas namn exakt som i deltagarlistan och användarnamnet.',
-        '- Var saklig och koncis. Sammanfatta diskussioner, återge inte ordagrant.',
-        '- Ta tydligt med beslut, åtgärdspunkter (vad, ansvarig, ev. deadline) och öppna frågor.',
-        '- Hitta inte på uppgifter som inte finns i underlaget. Om något är oklart, skriv det.',
-        '- Talaretiketter som "Talare 1" ska inte användas som namn i protokollet om personens namn inte är känt – beskriv då rollen eller skriv "en deltagare".',
-        '- Etiketterna "Övriga deltagare" och "Deltagare" betyder att talaren inte är identifierad (flera personer kan dölja sig bakom samma etikett). Härled vem som säger vad ur sammanhanget (tilltal, presentationer, deltagarlistan) när det går, annars skriv neutralt.',
-        hasAgenda
-          ? '- Protokollet SKA följa agendans struktur och punktordning. Varje agendapunkt blir en egen rubrik/paragraf. Diskussioner som inte passar någon punkt läggs under "Övriga frågor".'
-          : '- Ingen agenda finns: strukturera protokollet efter de ämnen som diskuterades.',
-        hasTemplates
-          ? '- Tidigare protokoll bifogas som MALL. Efterlikna deras layout, rubriker, numrering, ton, tabeller och detaljnivå så nära som möjligt – men använd endast innehåll från detta möte.'
-          : '- Använd en klassisk protokollstruktur: rubrik, datum/tid, närvarande, punkter (§1, §2 …), beslut, åtgärdslista i tabell, nästa möte om det nämns.',
-        meeting.instructions?.trim() ? `\nSärskilda instruktioner från användaren:\n${meeting.instructions.trim()}` : '',
-        '',
-        'Mötesinformation:',
-        `- Rubrik: ${meeting.title}`,
-        `- Datum: ${date.toLocaleDateString('sv-SE', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}`,
-        `- Starttid: ${date.toLocaleTimeString('sv-SE', { hour: '2-digit', minute: '2-digit' })}`,
-        `- Längd (inspelad tid): cirka ${Math.round((meeting.durationSec || 0) / 60)} minuter`,
-        `- Typ: ${meeting.mode === 'physical' ? 'Fysiskt möte' : 'Digitalt möte'}`,
-        `- Protokollet förs av / användaren: ${userName || 'okänd'}`,
-        meeting.participants?.trim() ? `- Angivna deltagare: ${meeting.participants.trim()}` : '',
-      ]
-        .filter((l) => l !== '')
-        .join('\n'),
+    const common = [
+      '- Svara ENDAST med dokumentet i Markdown (inga förklaringar före eller efter, inga kodblock runt).',
+      '- Skriv på korrekt, professionell svenska – även när delar av mötet hölls på engelska. Sammanfatta engelska inlägg på svenska; etablerade engelska fackuttryck och namn får stå kvar.',
+      '- Stava deltagarnas namn exakt som i deltagarlistan.',
+      '- Hitta aldrig på uppgifter. Om något är oklart: skriv "[oklart]" i stället för att gissa.',
+      '',
+      'Personer, roller och organisation (mycket viktigt):',
+      '- Bolag/organisation: använd i första hand det som anges under Mötesinformation, i andra hand det som uttryckligen sägs i mötet.',
+      '- Roller som ordförande, sekreterare/protokollförare och justerare: leta aktivt i transkriptionen efter när de utses eller nämns (t.ex. "till ordförande valdes …", "jag för protokollet", "Anna justerar") och använd det. Står rollen i deltagarlistan gäller den.',
+      '- Personen som spelade in mötet är INTE automatiskt sekreterare eller protokollförare.',
+      '- Talaretiketter som "Talare 3" är oidentifierade röster – använd dem aldrig som namn. Härled namnet ur sammanhanget (tilltal, presentationer, deltagarlistan) när det är tydligt, annars skriv "en deltagare".',
+      '- "Övriga deltagare" och "Deltagare" kan dölja flera personer.',
     ];
+
+    const rules = notes
+      ? [
+          'Du är en skicklig mötesanteckare. Skriv MINNESANTECKNINGAR (inte ett formellt protokoll) från mötet nedan.',
+          '',
+          'Form (egen, enkel stil – följ inga protokollmallar, inga §-paragrafer):',
+          '- # Minnesanteckningar – <mötets rubrik>, följt av en rad med datum och deltagare.',
+          '- ## Sammanfattning – 3–6 meningar om vad mötet handlade om och vad det ledde till.',
+          '- ## Det här pratade vi om – en underrubrik per ämne' + (hasAgenda ? ' (i agendans ordning)' : '') + ' med korta punktlistor: vad som sades, vem som tyckte vad, siffror och fakta.',
+          '- ## Beslut – punktlista (skriv "Inga beslut fattades" om så är fallet).',
+          '- ## Att göra – tabell: Vad | Vem | När.',
+          '- ## Öppna frågor – det som inte blev löst.',
+          '- Personlig, lättläst ton. Ta med detaljer som är bra att minnas.',
+          '',
+          'Krav:',
+          ...common,
+        ]
+      : [
+          'Du är en erfaren mötessekreterare. Skriv ett professionellt MÖTESPROTOKOLL på svenska utifrån transkriptionen nedan.',
+          '',
+          'Krav:',
+          ...common,
+          '- Var saklig och koncis. Sammanfatta diskussioner, återge inte ordagrant.',
+          '- Ta tydligt med beslut, åtgärdspunkter (vad, ansvarig, ev. deadline) och öppna frågor.',
+          hasAgenda
+            ? '- Protokollet SKA följa agendans struktur och punktordning. Varje agendapunkt blir en egen rubrik/paragraf. Diskussioner som inte passar någon punkt läggs under "Övriga frågor".'
+            : '- Ingen agenda finns: strukturera protokollet efter de ämnen som diskuterades.',
+          hasTemplates
+            ? [
+                '',
+                'MALL (tidigare protokoll bifogas längre ned):',
+                '- Protokollet ska se ut EXAKT som mallen: samma rubriker ordagrant, samma ordning, samma numrering (t.ex. § 1, § 2 …), samma fasta formuleringar (t.ex. "Mötets öppnande", "Val av justerare", "Mötets avslutande"), samma tabeller, samma sidhuvudtext överst och samma signatur-/justeringsrader längst ned.',
+                '- Fyll mallens struktur med innehåll från DETTA möte. Punkter i mallen som inte behandlades: ta med rubriken och skriv "Ingenting att rapportera" om det är en stående punkt, annars utelämna den.',
+                '- Namn, bolag, datum, belopp och organisationsnummer i mallen gäller ett TIDIGARE möte. Kopiera dem aldrig – använd Mötesinformation och transkriptionen. Undantag: uppgifter som uttryckligen bekräftas i detta möte.',
+              ].join('\n')
+            : '- Använd en klassisk protokollstruktur: rubrik, datum/tid, plats, närvarande (med roller), punkter (§1, §2 …), beslut, åtgärdslista i tabell, nästa möte om det nämns, justering.',
+        ];
+
+    const info = [
+      '',
+      'Mötesinformation (gäller före allt annat):',
+      '- Rubrik: ' + meeting.title,
+      meeting.organization?.trim() ? '- Bolag/organisation: ' + meeting.organization.trim() : '- Bolag/organisation: ej angivet – ta det från mötet om det sägs, annars utelämna',
+      '- Datum: ' + date.toLocaleDateString('sv-SE', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' }),
+      '- Starttid: ' + date.toLocaleTimeString('sv-SE', { hour: '2-digit', minute: '2-digit' }),
+      '- Längd (inspelad tid): cirka ' + Math.round((meeting.durationSec || 0) / 60) + ' minuter',
+      '- Typ: ' + (meeting.mode === 'physical' ? 'Fysiskt möte' : 'Digitalt möte'),
+      meeting.participants?.trim() ? '- Deltagare (med ev. roller): ' + meeting.participants.trim() : '- Deltagare: ej angivna – ta dem från mötet',
+      userName ? '- Mötet spelades in av: ' + userName + ' (säger inget om vilken roll personen har)' : '',
+    ];
+    const instructions = meeting.instructions?.trim() ? ['', 'Särskilda instruktioner från användaren:', meeting.instructions.trim()] : [];
+    const parts = [[...rules, ...instructions, ...info].filter((l) => l !== '').join('\n')];
 
     if (hasAgenda) {
       parts.push('\n=== AGENDA ===');
@@ -361,16 +397,16 @@ async function generateProtocol({ apiKey, models, meeting, transcriptText, agend
       for (const f of agendaFiles) parts.push(...(await fileToParts(ai, f, uploaded)));
     }
     if (hasTemplates) {
-      parts.push('\n=== TIDIGARE PROTOKOLL (MALL – endast för form och stil) ===');
-      for (const t of templateTexts) parts.push(`--- ${t.name} ---\n${t.text}`);
+      parts.push('\n=== MALL: TIDIGARE PROTOKOLL (form och fasta formuleringar – INTE innehåll, namn eller bolag) ===');
+      for (const t of templateTexts) parts.push('--- ' + t.name + ' ---\n' + t.text);
       for (const f of templateFiles) parts.push(...(await fileToParts(ai, f, uploaded)));
     }
-    parts.push('\n=== TRANSKRIPTION ([tid] talare: text) ===\n' + (transcriptText || '(ingen transkription)'));
+    parts.push('\n=== TRANSKRIPTION AV DETTA MÖTE ([tid] talare: text) ===\n' + (transcriptText || '(ingen transkription)'));
 
-    const res = await generateFast(ai, models, { contents: createUserContent(parts), config: { temperature: 0.4, maxOutputTokens: 65536 } }, { timeoutMs: Math.min(300000, 90000 + (transcriptText || '').length), hedgeMs: 40000 });
+    const res = await generateFast(ai, models, { contents: createUserContent(parts), config: { temperature: 0.3, maxOutputTokens: 65536 } }, { timeoutMs: Math.min(300000, 90000 + (transcriptText || '').length), hedgeMs: 40000 });
     return String(res.text || '')
-      .replace(/^\s*```(?:markdown|md)?\s*\n/i, '')
-      .replace(/\n```\s*$/, '')
+      .replace(/^\s*`{3}(?:markdown|md)?\s*\n/i, '')
+      .replace(/\n`{3}\s*$/, '')
       .trim();
   } finally {
     for (const u of uploaded) ai.files.delete({ name: u.name }).catch(() => {});

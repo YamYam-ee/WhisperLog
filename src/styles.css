@@ -320,3 +320,32 @@ select.input { appearance: auto; }
   .editor-split { grid-template-columns: 1fr; }
   .mode-picker.three { grid-template-columns: 1fr; }
 }
+
+/* ---------- Röster och personval */
+.identify-card { flex-direction: row; align-items: center; justify-content: space-between; gap: 18px; border-color: #a7f3d0; background: linear-gradient(135deg, #f0fdf9, #fff 60%); }
+.identify-card.subtle { border-color: var(--line); background: var(--panel); }
+.identify-card p { margin: 2px 0 0; }
+.voice-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 8px 16px; }
+.voice-row { display: flex; align-items: center; gap: 10px; padding: 4px 0; }
+.voice-row .orig { width: 70px; font-size: 12.5px; color: var(--muted); flex: none; }
+.voice-row .muted { margin-left: auto; }
+.chip-wrap { position: relative; display: inline-block; }
+.chip { background: none; border: 1px dashed transparent; padding: 1px 6px; margin-left: -6px; border-radius: 6px; font-weight: 650; font-size: 13px; cursor: pointer; }
+.chip:hover { border-color: currentColor; background: var(--panel2); }
+.picker { position: absolute; z-index: 30; top: calc(100% + 4px); left: -6px; width: 260px; background: #fff; border: 1px solid var(--line2); border-radius: 12px; box-shadow: 0 14px 34px rgba(28, 39, 45, 0.18); padding: 10px; display: flex; flex-direction: column; gap: 6px; color: var(--text); font-weight: 400; }
+.picker-head { font-size: 13px; padding: 2px 4px 4px; }
+.picker-hint { padding: 0 4px; margin: 0; }
+.picker-list { display: flex; flex-direction: column; gap: 2px; max-height: 220px; overflow-y: auto; }
+.picker-item { display: flex; align-items: center; gap: 8px; text-align: left; background: none; border: 0; padding: 7px 8px; border-radius: 8px; font-size: 13.5px; }
+.picker-item:hover { background: #f0fdf9; color: var(--teal); }
+.picker-other { display: flex; gap: 6px; }
+.picker-single { padding: 2px 4px; }
+.picker-clear { align-self: flex-start; }
+.live-conv { border-color: #a7f3d0; }
+.voice-chips { display: flex; flex-wrap: wrap; gap: 6px 14px; padding: 2px 6px; }
+.voice-chips .chip { border: 1px solid var(--line2); background: #fff; margin-left: 0; padding: 3px 10px; }
+.live-rows { display: flex; flex-direction: column; }
+.live-row { display: grid; grid-template-columns: 52px auto 1fr; gap: 10px; align-items: baseline; padding: 7px 0; border-top: 1px solid var(--line); }
+.live-row p { margin: 0; line-height: 1.5; }
+.live-row .who.muted { font-size: 13px; font-weight: 600; }
+.warn-text { color: var(--warn); }

@@ -22,6 +22,32 @@ class LiveTrack {
     this.queue = [];
     this.lastMsgAt = 0;
     this.closed = false;
+    // De senaste ~2 minuternas ljud (för röstavtryck per replik): [{offset, pcm}]
+    this.history = [];
+  }
+
+  remember(buf, offset) {
+    this.history.push({ offset, pcm: new Int16Array(buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.length)) });
+    while (this.history.length && this.history[0].offset < offset - 120) this.history.shift();
+  }
+
+  // Ljud mellan två mötestider (s) som Int16Array.
+  audio(from, to) {
+    const parts = [];
+    for (const h of this.history) {
+      const end = h.offset + h.pcm.length / 16000;
+      if (end <= from || h.offset >= to) continue;
+      const a = Math.max(0, Math.round((from - h.offset) * 16000));
+      const b = Math.min(h.pcm.length, Math.round((to - h.offset) * 16000));
+      parts.push(h.pcm.subarray(a, b));
+    }
+    const out = new Int16Array(parts.reduce((n, p) => n + p.length, 0));
+    let o = 0;
+    for (const p of parts) {
+      out.set(p, o);
+      o += p.length;
+    }
+    return out;
   }
 
   // Öppnar en ny session. `base` = mötestiden (s) då sessionens första ljudbyte skickas.
@@ -51,7 +77,8 @@ class LiveTrack {
       const t = st.pendingStart ?? Math.max(st.base, st.base + st.sentBytes / BYTES_PER_SEC - 10);
       // Live-texten saknar ibland mellanslag efter punkt ("helskärm.Man") – lägg till det.
       const text = tr.text.trim().replace(/([.!?])(?=\p{Lu})/gu, '$1 ');
-      this.onEntry({ t: Math.round(t * 10) / 10, track: this.track, text, lang: tr.languageCode || '' });
+      const now = st.base + st.sentBytes / BYTES_PER_SEC;
+      this.onEntry({ t: Math.round(t * 10) / 10, end: Math.round(now * 10) / 10, track: this.track, text, lang: tr.languageCode || '' }, this);
       st.pendingStart = null;
     }
   }
@@ -67,6 +94,7 @@ class LiveTrack {
   // Skickar en ljudbit. `offset` = mötestiden (s) för bitens början.
   push(buf, offset) {
     if (this.closed) return;
+    this.remember(buf, offset);
     const st = this.current;
     if (st && !st.ended) {
       const age = Date.now() - st.startedAt;
