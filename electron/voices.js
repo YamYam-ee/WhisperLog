@@ -141,7 +141,7 @@ async function embed(pcm16) {
  * Returnerar Map id -> etikett. Befintliga etiketter återanvänds för den grupp som har flest
  * av sina tidigare repliker; nya grupper får lägsta lediga nummer.
  */
-function cluster(items, reserved = new Set()) {
+function cluster(items, reserved = new Set(), { minShare = 0 } = {}) {
   const withEmb = items.filter((x) => x.emb);
   const result = new Map();
   if (!withEmb.length) return { labels: result };
@@ -200,6 +200,32 @@ function cluster(items, reserved = new Set()) {
     if (best >= 0 && bs >= 0.1) {
       members[best].push(...members[i]);
       alive[i] = false;
+    }
+  }
+  // Röster med mycket lite taltid (minShare av allt tal) slås ihop med den röst de liknar mest.
+  if (minShare > 0) {
+    const dur = (i) => members[i].reduce((sum, k) => sum + (withEmb[k].dur || 1), 0);
+    const centroid = (i) => norm(members[i].reduce((acc, k) => acc.map((x, d) => x + E[k][d]), E[0].map(() => 0)));
+    const total = withEmb.reduce((sum, x) => sum + (x.dur || 1), 0);
+    for (;;) {
+      const groups = [];
+      for (let i = 0; i < n; i++) if (alive[i]) groups.push(i);
+      if (groups.length < 2) break;
+      const small = groups.filter((i) => dur(i) < minShare * total).sort((a, b) => dur(a) - dur(b))[0];
+      if (small == null) break;
+      const c = centroid(small);
+      let best = -1;
+      let bs = -2;
+      for (const j of groups) {
+        if (j === small) continue;
+        const s2 = dot(c, centroid(j));
+        if (s2 > bs) {
+          bs = s2;
+          best = j;
+        }
+      }
+      members[best].push(...members[small]);
+      alive[small] = false;
     }
   }
   const C = members.filter((_, i) => alive[i]).map((m) => ({ m }));

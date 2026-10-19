@@ -29,6 +29,7 @@ contextBridge.exposeInMainWorld('api', {
   transcribe: invoke('meetings:transcribe'),
   retranscribe: invoke('meetings:retranscribe'),
   identifyVoices: invoke('meetings:identifyVoices'),
+  refineSpeakers: invoke('meetings:refineSpeakers'),
   openStorageRoot: invoke('storage:openRoot'),
   openLog: invoke('app:openLog'),
   appVersion: invoke('app:version'),

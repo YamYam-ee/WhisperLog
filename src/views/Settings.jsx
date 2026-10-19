@@ -291,6 +291,9 @@ function TranscriptionSettings({ s, save, check, toast }) {
         <input type="checkbox" {...check('autoTranscribe')} /> Transkribera i bakgrunden under mötet (texten är klar när mötet slutar)
       </label>
       <label className="toggle">
+        <input type="checkbox" checked={s.autoRefine !== false} onChange={(e) => save({ autoRefine: e.target.checked })} /> Förfina talare automatiskt efter mötet (Gemini delar per tur, röstigenkänningen avgör vem)
+      </label>
+      <label className="toggle">
         <input type="checkbox" {...check('autoProtocol')} /> Skapa protokoll automatiskt när transkriberingen är klar
       </label>
     </section>

@@ -209,7 +209,7 @@ const transcriptSchema = {
  * Transkriberar ett segment. `tracks` är [{path, label, description}] – alla filer
  * startar samtidigt. Returnerar [{t, speaker, text}] med t i sekunder relativt segmentet.
  */
-async function transcribe({ apiKey, models, tracks, userName, participants, mode, knownSpeakers, previousTail, durationSec }) {
+async function transcribe({ apiKey, models, tracks, userName, participants, mode, knownSpeakers, previousTail, durationSec, turns = false }) {
   const ai = client(apiKey);
   const uploaded = [];
   try {
@@ -253,8 +253,12 @@ async function transcribe({ apiKey, models, tracks, userName, participants, mode
       previousTail ? `\nDe sista replikerna från föregående del av mötet (för sammanhang):\n${previousTail}` : '',
       '',
       'Format:',
-      '- Ett nytt inlägg varje gång talaren byts, eller ungefär var 30:e sekund vid långa monologer.',
-      `- "start" anges som MM:SS relativt ljudfilens början${durationSec ? ` (ljudet är cirka ${Math.round(durationSec)} sekunder långt)` : ''}.`,
+      turns
+        ? '- Börja ett NYTT inlägg varje gång en annan person börjar prata – även vid korta inpass ("ja", "mm", "precis"), en fråga som följs av ett svar, eller när någon avbryter. Lägg ALDRIG två personers tal i samma inlägg. Dela inte upp en och samma persons sammanhängande tal.'
+        : '- Ett nytt inlägg varje gång talaren byts, eller ungefär var 30:e sekund vid långa monologer.',
+      turns
+        ? `- "start" anges som MM:SS.d (med tiondelar) – exakt när personen börjar prata, relativt ljudfilens början${durationSec ? ` (ljudet är cirka ${Math.round(durationSec)} sekunder långt)` : ''}.`
+        : `- "start" anges som MM:SS relativt ljudfilens början${durationSec ? ` (ljudet är cirka ${Math.round(durationSec)} sekunder långt)` : ''}.`,
       '- Hoppa över tystnad, musik och bakgrundsljud. Om inget tal finns, returnera en tom lista.',
     ].filter((l) => l !== '');
 

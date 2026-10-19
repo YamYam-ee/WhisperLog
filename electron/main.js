@@ -91,6 +91,7 @@ const DEFAULT_SETTINGS = {
   localModel: 'turbo',
   // transcriptionEngine: 'live' = Gemini Live under mötet (standard), 'gemini' = efteråt med talaridentifiering, 'local' = Whisper // KB-modellerna översätter engelska till svenska – turbo behåller språket
   autoProtocol: false,
+  autoRefine: true, // förfina talare automatiskt efter Live-möten
   openAtLogin: false,
   shortcutPause: 'CommandOrControl+Alt+P',
 };
@@ -606,6 +607,176 @@ async function identifyVoicesPostHoc(id, { only = null } = {}) {
   }
 }
 
+/**
+ * Förfina talare: Gemini lyssnar igenom varje del och delar texten per tur (var talarbytena
+ * sker – även korta svar), och röstavtrycken avgör vem varje tur är i hela mötet.
+ * Varje Gemini-etikett i en del kopplas till den globala röst som oftast hörs i dess turer.
+ */
+async function refineSpeakers(id) {
+  if (identifying.has(id)) throw new Error('Talarna bearbetas redan för mötet');
+  identifying.add(id);
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'whisperlog-refine-'));
+  try {
+    console.log('Förfina talare startar för', id);
+    storage.update(id, { identifyingVoices: 0, identifyingStage: 'Förbereder röstigenkänningen…' });
+    await voices.check();
+    const m = storage.load(id);
+    const segs = m.segments.filter((s) => (s.durationSec || 0) >= 1 && (s.files?.mix || s.files?.mic || s.files?.system));
+    if (!segs.length) throw new Error('Mötet har inget ljud att bearbeta');
+    const models = await modelChain('flash');
+    let done = 0;
+    const progress = (stage) => storage.update(id, { identifyingVoices: Math.round((100 * done) / (segs.length * 2)), identifyingStage: stage });
+
+    // 1. Gemini: turer per del (tre delar parallellt).
+    const turnsBySeg = new Map();
+    await runPool(
+      segs.map((s) => s.index),
+      3,
+      async (index) => {
+        const s = m.segments.find((x) => x.index === index);
+        const tracks = [];
+        for (const key of ['mic', 'system']) {
+          const rel = s.files?.[key];
+          if (!rel) continue;
+          const src = storage.resolveInMeeting(id, rel);
+          if (!fs.existsSync(src) || fs.statSync(src).size < 2000) continue;
+          let mp3 = src;
+          if (!src.toLowerCase().endsWith('.mp3')) {
+            mp3 = path.join(tmp, index + '-' + key + '.mp3');
+            await audio.toSpeechMp3(src, mp3);
+          }
+          tracks.push({ path: mp3, ...TRACK_INFO[key](m) });
+        }
+        if (!tracks.length && s.files?.mix) {
+          const mp3 = path.join(tmp, index + '-mix.mp3');
+          await audio.toSpeechMp3(storage.resolveInMeeting(id, s.files.mix), mp3);
+          tracks.push({ path: mp3, label: 'MÖTET', description: 'Allt ljud i mötet.' });
+        }
+        try {
+          const entries = await gemini.transcribe({
+            apiKey: getApiKey(),
+            models,
+            tracks,
+            userName: settings.userName,
+            participants: m.participants,
+            mode: m.mode,
+            knownSpeakers: [],
+            previousTail: '',
+            durationSec: s.durationSec,
+            turns: true,
+          });
+          turnsBySeg.set(index, entries);
+        } catch (e) {
+          console.warn('Förfina talare: Gemini misslyckades för del ' + index + ':', e.message);
+        }
+        done++;
+        progress('Gemini lyssnar igenom mötet och delar upp det per talare…');
+      }
+    );
+    if (!turnsBySeg.size) throw new Error('Gemini kunde inte bearbeta mötet just nu – försök igen om en stund.');
+
+    // 2. Röstavtryck per tur (ur hela mötets ljud för delen).
+    const st = voiceStateFor(id);
+    const items = [];
+    for (const s of segs) {
+      const turns = turnsBySeg.get(s.index);
+      if (!turns) continue;
+      const rel = s.files?.mix || s.files?.mic || s.files?.system;
+      const wav = path.join(tmp, s.index + '-voice.wav');
+      await audio.toWav16k(storage.resolveInMeeting(id, rel), wav);
+      const pcm = readPcm(wav);
+      const segLen = pcm.length / 16000;
+      const sorted = turns.slice().sort((a, b) => a.t - b.t);
+      for (let i = 0; i < sorted.length; i++) {
+        const from = sorted[i].t;
+        // Slutet: nästa tur, men högst så länge orden rimligen tar att säga (~0,5 s/ord) – så att
+        // tystnad och nästa talare inte hamnar i avtrycket.
+        const words = String(sorted[i].text).split(/\s+/).filter(Boolean).length;
+        const to = Math.min(sorted[i + 1]?.t ?? segLen, segLen, from + 20, from + 1.5 + words * 0.5);
+        // Kärnan av turen (gränserna från Gemini är på sekunden när) – minst 1 s.
+        const a = from + 0.3;
+        const b = to - 0.3;
+        sorted[i].dur = Math.max(0.1, to - from);
+        if (b - a < 1) continue;
+        const emb = await voices.embed(pcm.subarray(Math.round(a * 16000), Math.round(b * 16000)));
+        if (emb) items.push({ id: 'r' + s.index + ':' + i, seg: s.index, idx: i, emb, dur: b - a, glabel: sorted[i].speaker });
+      }
+      turnsBySeg.set(s.index, sorted);
+      done++;
+      progress('Känner igen rösterna…');
+    }
+
+    // 3. Gruppera turerna i hela mötet. Tidigare etiketter (och namn) ärvs via tidpunkt.
+    const old = st.items.filter((it) => String(it.id).startsWith('r') || String(it.id).startsWith('p'));
+    for (const it of items) {
+      const seg = m.segments.find((x) => x.index === it.seg);
+      const t = seg.startOffset + turnsBySeg.get(it.seg)[it.idx].t;
+      const prev = old.find((o) => o.voice && o.from <= t + 1 && o.to >= t - 1);
+      if (prev) it.voice = prev.voice;
+    }
+    const { labels } = voices.cluster(items, reservedLabels(id), { minShare: 0.04 });
+
+    // 4. Varje Gemini-etikett i en del → den röst som hörs mest i dess turer.
+    const mapping = new Map(); // seg|glabel -> voice
+    const votes = new Map();
+    for (const it of items) {
+      const key = it.seg + '|' + it.glabel;
+      if (!votes.has(key)) votes.set(key, {});
+      const v = votes.get(key);
+      v[labels.get(it.id)] = (v[labels.get(it.id)] || 0) + it.dur;
+    }
+    for (const [key, v] of votes) mapping.set(key, Object.entries(v).sort((a, b) => b[1] - a[1])[0][0]);
+
+    // Spara avtrycken (för stabila etiketter vid nästa körning).
+    st.items = st.items.filter((it) => !String(it.id).startsWith('r') && !String(it.id).startsWith('p'));
+    for (const it of items) {
+      const seg = m.segments.find((x) => x.index === it.seg);
+      const turn = turnsBySeg.get(it.seg)[it.idx];
+      st.items.push({ id: it.id, entry: 'r' + it.seg + ':' + it.idx, from: seg.startOffset + turn.t, to: seg.startOffset + turn.t + turn.dur, emb: it.emb, voice: mapping.get(it.seg + '|' + it.glabel), track: 'system' });
+    }
+    saveVoicesSoon(st);
+
+    // Längre turer (≥ 3 s) avgörs av sitt eget röstavtryck; korta turer (för lite ljud för ett
+    // säkert avtryck) får rösten som deras Gemini-etikett hör ihop med i delen.
+    // En röst som bara förekommer i en enda tur är oftast en avvikelse (skratt, brus) – då får
+    // Gemini-etiketten avgöra i stället.
+    const turnsPerVoice = {};
+    for (const it of items) turnsPerVoice[labels.get(it.id)] = (turnsPerVoice[labels.get(it.id)] || 0) + 1;
+    const own = new Map(items.filter((it) => it.dur >= 3 && turnsPerVoice[labels.get(it.id)] > 1).map((it) => [it.seg + ':' + it.idx, labels.get(it.id)]));
+    storage.update(id, (mm) => {
+      for (const s of mm.segments) {
+        const turns = turnsBySeg.get(s.index);
+        if (!turns) continue;
+        const rows = [];
+        turns.forEach((e, i) => {
+          let speaker = own.get(s.index + ':' + i) || mapping.get(s.index + '|' + e.speaker);
+          if (!speaker) speaker = rows.length ? rows[rows.length - 1].speaker : e.speaker;
+          const t = Math.round((s.startOffset + e.t) * 10) / 10;
+          const prev = rows[rows.length - 1];
+          // Slå ihop direkt efterföljande turer från samma person.
+          if (prev && prev.speaker === speaker) prev.text += ' ' + e.text;
+          else rows.push({ t, speaker, text: e.text });
+        });
+        s.transcript = rows;
+        s.engine = 'gemini';
+        s.voicesIdentified = true;
+        s.refined = true;
+      }
+      mm.identifyingVoices = null;
+      mm.identifyingStage = null;
+    });
+    console.log('Förfina talare klar för', id);
+    return meetingFull(id);
+  } catch (e) {
+    console.error('Förfina talare misslyckades för', id, e);
+    storage.update(id, { identifyingVoices: null, identifyingStage: null });
+    throw e;
+  } finally {
+    identifying.delete(id);
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
 function liveFor(id) {
   if (!lives.has(id)) {
     lives.set(
@@ -935,6 +1106,10 @@ async function finalizeMeeting(id, { transcribe = true, engine = settings.transc
     return;
   }
   storage.update(id, { status: m.hasProtocol ? 'done' : 'transcribed' });
+  // Efter ett Live-möte: förfina talarna i bakgrunden (Gemini-turer + röstigenkänning).
+  if (settings.autoRefine !== false && m.liveEnabled && getApiKey() && voices.ready()) {
+    await refineSpeakers(id).catch((e) => console.warn('Automatisk förfining av talare misslyckades:', e.message));
+  }
   if (settings.autoProtocol && !m.hasProtocol && getApiKey()) {
     try {
       await generateProtocol(id);
@@ -1109,6 +1284,7 @@ function registerIpc() {
     return meetingFull(id);
   });
   h('meetings:identifyVoices', (id) => identifyVoicesPostHoc(id));
+  h('meetings:refineSpeakers', (id) => refineSpeakers(id));
   h('meetings:delete', async (id) => {
     const dir = storage.remove(id);
     await shell.trashItem(dir); // till papperskorgen, inte permanent radering

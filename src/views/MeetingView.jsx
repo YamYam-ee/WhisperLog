@@ -201,12 +201,14 @@ function TranscriptTab({ m, setM, seek, isLive }) {
   const name = (s) => displayName(m, s);
   const hasVoices = speakers.some((s) => /^Talare \d+$/.test(s));
   const identifying = m.identifyingVoices != null || identBusy;
-  const identify = async () => {
-    if (hasVoices && !confirm('Identifiera rösterna på nytt? Repliker som du ändrat för hand kan få en ny röst. Namn du satt på rösterna behålls.')) return;
+  const refined = m.segments.some((s) => s.refined);
+  // mode: 'refine' = Gemini delar per tur + röstavtryck (bäst), 'quick' = bara röstavtryck lokalt
+  const identify = async (mode = 'refine') => {
+    if ((hasVoices || refined) && !confirm('Gå igenom talarna på nytt? Ändringar du gjort för hand på enskilda repliker ersätts. Namn du satt på rösterna behålls.')) return;
     setIdentBusy(true);
     setIdentFailed(false);
     try {
-      setM(await api.identifyVoices(m.id));
+      setM(mode === 'refine' ? await api.refineSpeakers(m.id) : await api.identifyVoices(m.id));
       toast('Klart! Välj nu vem varje röst är.', 'ok');
     } catch (e) {
       toast(String(e.message).replace(/^Error invoking remote method '[^']+': (Error: )?/, ''), 'err');
@@ -228,19 +230,24 @@ function TranscriptTab({ m, setM, seek, isLive }) {
       {entries.length > 0 && !isLive && (
         <div className={'card identify-card' + (hasVoices ? ' subtle' : '')}>
           <div>
-            <b>{hasVoices ? 'Rösterna är identifierade' : 'Vem sa vad?'}</b>
+            <b>{refined ? 'Talarna är förfinade' : hasVoices ? 'Rösterna är identifierade' : 'Vem sa vad?'}</b>
             <p className="muted small">
               {identifying
                 ? `${m.identifyingStage || 'Lyssnar igenom mötet…'} ${m.identifyingVoices ? m.identifyingVoices + ' %' : ''}`
-                : hasVoices
-                  ? 'Stämmer det inte? Identifiera rösterna på nytt – namnen du satt finns kvar.'
-                  : 'WhisperLog lyssnar igenom ljudet och delar upp texten per röst (Talare 1, 2, 3 …) – lokalt på datorn. Sedan väljer du vem varje röst är.'}
+                : refined
+                  ? 'Gemini har delat upp texten per tur och rösterna känts igen. Stämmer något inte: klicka på namnet på en replik.'
+                  : 'Förfina talare: Gemini lyssnar igenom mötet och delar upp texten varje gång någon ny tar ordet (även korta svar), och röstigenkänningen avgör vem som är vem. Tar någon minut per timme möte.'}
             </p>
           </div>
           <div className="identify-actions">
-            <button className={'btn ' + (hasVoices ? 'sm' : 'primary')} disabled={identifying || m.status === 'processing'} onClick={identify}>
-              {identifying ? <span className="spinner" /> : <IconUsers size={16} />} {hasVoices ? 'Identifiera igen' : 'Identifiera röster'}
+            <button className={'btn ' + (refined ? 'sm' : 'primary')} disabled={identifying || m.status === 'processing'} onClick={() => identify('refine')}>
+              {identifying ? <span className="spinner" /> : <IconUsers size={16} />} {refined ? 'Förfina igen' : 'Förfina talare'}
             </button>
+            {!identifying && (
+              <button className="btn ghost sm" disabled={m.status === 'processing'} onClick={() => identify('quick')} title="Bara röstigenkänning på datorn – snabbt, men grövre uppdelning">
+                Snabb (bara lokalt)
+              </button>
+            )}
             {identFailed && (
               <button
                 className="btn sm"
