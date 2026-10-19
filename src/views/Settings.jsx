@@ -12,6 +12,10 @@ export default function Settings() {
   const [models, setModels] = useState([]);
   const [mics, setMics] = useState([]);
   const [testing, setTesting] = useState(false);
+  const [version, setVersion] = useState('');
+  useEffect(() => {
+    api.appVersion().then(setVersion);
+  }, []);
 
   useEffect(() => setS(settings), [settings]);
 
@@ -190,6 +194,16 @@ export default function Settings() {
             <IconFolder /> Välj mapp
           </button>
         </div>
+      </section>
+
+      <section className="card">
+        <h3>Felsökning</h3>
+        <p className="muted small">
+          WhisperLog {version} · Om något går fel sparas orsaken i en loggfil. Skicka den gärna vidare om du behöver hjälp.
+        </p>
+        <button className="btn sm" style={{ alignSelf: 'flex-start' }} onClick={() => api.openLog()}>
+          <IconFolder size={15} /> Visa loggfilen
+        </button>
       </section>
     </div>
   );

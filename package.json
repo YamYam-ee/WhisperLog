@@ -1,7 +1,7 @@
 {
   "name": "whisperlog",
   "productName": "WhisperLog",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Spelar in, transkriberar och protokollför möten med Gemini",
   "author": "WhisperLog",
   "main": "electron/main.js",

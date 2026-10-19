@@ -228,7 +228,7 @@ function TranscriptTab({ m, setM, seek, isLive }) {
             <b>{hasVoices ? 'Rösterna är identifierade' : 'Vem sa vad?'}</b>
             <p className="muted small">
               {identifying
-                ? `Lyssnar igenom mötet och känner igen rösterna… ${m.identifyingVoices ?? 0} %`
+                ? `${m.identifyingStage || 'Lyssnar igenom mötet…'} ${m.identifyingVoices ? m.identifyingVoices + ' %' : ''}`
                 : hasVoices
                   ? 'Stämmer det inte? Identifiera rösterna på nytt – namnen du satt finns kvar.'
                   : 'WhisperLog lyssnar igenom ljudet och delar upp texten per röst (Talare 1, 2, 3 …) – lokalt på datorn. Sedan väljer du vem varje röst är.'}

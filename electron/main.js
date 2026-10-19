@@ -426,7 +426,7 @@ function saveVoicesSoon(st) {
 
 // Räknar ut röstavtryck för en ny replik (i 6-sekundersbitar, så att talarbyten inom en lång
 // replik fångas) och grupperar om alla röster i mötet.
-function identifyVoice(id, entry, track) {
+async function identifyVoice(id, entry, track) {
   if (!voices.ready()) return;
   try {
     const st = voiceStateFor(id);
@@ -444,7 +444,7 @@ function identifyVoice(id, entry, track) {
       const e = Math.min(s + 6, to);
       const pcm = track.audio(s, e);
       if (other && level(other.audio(s, e)) > level(pcm) * 0.6) continue;
-      const emb = voices.embed(pcm);
+      const emb = await voices.embed(pcm);
       if (emb) st.items.push({ id: entry.id + ':' + k, entry: entry.id, from: s, to: e, emb, track: entry.track });
     }
     if (!st.items.some((it) => it.entry === entry.id)) return;
@@ -503,13 +503,15 @@ async function identifyVoicesPostHoc(id, { only = null } = {}) {
   identifying.add(id);
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'whisperlog-voices-'));
   try {
-    await voices.ensureModel();
+    console.log('Röstidentifiering startar för', id);
+    storage.update(id, { identifyingVoices: 0, identifyingStage: 'Förbereder röstigenkänningen (första gången laddas en modell på 27 MB ner)…' });
+    await voices.check();
     const m = storage.load(id);
     const st = voiceStateFor(id);
     const segs = m.segments.filter((s) => s.transcript?.length && (!only || only.includes(s.index)));
     const totalSec = segs.reduce((n, s) => n + (s.durationSec || 0), 0) || 1;
     let doneSec = 0;
-    storage.update(id, { identifyingVoices: 0 });
+    storage.update(id, { identifyingVoices: 0, identifyingStage: 'Lyssnar igenom mötet…' });
     const newItems = [];
     for (const s of segs) {
       const read = async (key) => {
@@ -532,12 +534,11 @@ async function identifyVoicesPostHoc(id, { only = null } = {}) {
         const to = Math.min((rows[i + 1]?.t ?? segEnd) - s.startOffset, from + 120, mix.length / 16000);
         for (let a = Math.max(0, from), k = 0; a < to - 1; a += 6, k++) {
           const b = Math.min(a + 6, to);
-          const emb = voices.embed(mix.subarray(Math.round(a * 16000), Math.round(b * 16000)));
+          const emb = await voices.embed(mix.subarray(Math.round(a * 16000), Math.round(b * 16000)));
           if (emb) {
             const track = mic && sys ? (rms(mic, a, b) >= rms(sys, a, b) ? 'mic' : 'system') : mic ? 'mic' : 'system';
             newItems.push({ id: 'p' + s.index + ':' + i + ':' + k, entry: 'p' + s.index + ':' + i, from: s.startOffset + a, to: s.startOffset + b, emb, track });
           }
-          await new Promise((r) => setImmediate(r)); // håll appen responsiv
         }
         doneSec = Math.min(totalSec, doneSec + (to - from));
         storage.update(id, { identifyingVoices: Math.round((100 * doneSec) / totalSec) });
@@ -590,11 +591,14 @@ async function identifyVoicesPostHoc(id, { only = null } = {}) {
         if (top && !mm.speakerMap[top[0]]) mm.speakerMap[top[0]] = settings.userName;
       }
       mm.identifyingVoices = null;
+      mm.identifyingStage = null;
     });
+    console.log('Röstidentifiering klar för', id);
     applyLiveEntries(id, { onlyLive: true });
     return meetingFull(id);
   } catch (e) {
-    storage.update(id, { identifyingVoices: null });
+    console.error('Röstidentifiering misslyckades för', id, e);
+    storage.update(id, { identifyingVoices: null, identifyingStage: null });
     throw e;
   } finally {
     identifying.delete(id);
@@ -612,7 +616,7 @@ function liveFor(id) {
           const st = voiceStateFor(id);
           e.id = ++st.seq;
           storage.update(id, (m) => (m.liveEntries = m.liveEntries || []).push(e));
-          setImmediate(() => identifyVoice(id, e, track));
+          st.chain = (st.chain || Promise.resolve()).then(() => identifyVoice(id, e, track));
         },
         onGap: (track, at) => storage.update(id, (m) => (m.liveGaps = m.liveGaps || []).push({ track, at })),
       })
@@ -1141,6 +1145,12 @@ function registerIpc() {
     return true;
   });
   h('storage:openRoot', () => shell.openPath(storage.getBaseDir()));
+  h('app:openLog', () => {
+    const f = path.join(app.getPath('userData'), 'whisperlog.log');
+    if (!fs.existsSync(f)) fs.writeFileSync(f, '');
+    shell.showItemInFolder(f);
+  });
+  h('app:version', () => app.getVersion());
 
   // --- Lokal Whisper
   h('whisper:status', () => localWhisper.status());
@@ -1309,6 +1319,10 @@ function registerIpc() {
 // ---------------------------------------------------------------- Uppstart
 function recoverInterrupted() {
   for (const s of storage.list()) {
+    const full = storage.load(s.id);
+    if (full && (full.identifyingVoices != null || full.generatingProtocol)) {
+      storage.update(s.id, { identifyingVoices: null, identifyingStage: null, generatingProtocol: false, generatingKind: null });
+    }
     if (['recording', 'paused', 'processing'].includes(s.status)) {
       storage.update(s.id, (m) => {
         m.status = 'interrupted';
@@ -1327,6 +1341,7 @@ app.whenReady().then(() => {
   localWhisper.init(path.join(app.getPath('userData'), 'whisper'));
   voices.init(path.join(app.getPath('userData'), 'voices'));
   voices.ensureModel().catch((e) => console.warn('Röstmodellen kunde inte laddas ner:', e.message));
+  console.log('WhisperLog ' + app.getVersion() + ' startar (' + process.platform + ' ' + process.arch + ', Electron ' + process.versions.electron + ')');
   storage.setBaseDir(settings.storageDir);
   recoverInterrupted();
   storage.events.on('updated', (id) => send('meeting:updated', id));

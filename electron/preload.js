@@ -30,6 +30,8 @@ contextBridge.exposeInMainWorld('api', {
   retranscribe: invoke('meetings:retranscribe'),
   identifyVoices: invoke('meetings:identifyVoices'),
   openStorageRoot: invoke('storage:openRoot'),
+  openLog: invoke('app:openLog'),
+  appVersion: invoke('app:version'),
   importAudio: invoke('import:audio'),
 
   generateProtocol: invoke('protocol:generate'),
